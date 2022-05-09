@@ -1,0 +1,249 @@
+version: 2.1
+commands:
+  install_deps:
+    steps:
+      - run:
+          name: Install dependencies
+          command: |
+            npm install --prefix src/
+
+  setup-cd:
+    steps:
+    - run: 
+        name: Configure environment
+        command: |
+          # install terraform
+          wget https://releases.hashicorp.com/terraform/0.15.4/terraform_0.15.4_linux_amd64.zip
+          unzip terraform_0.15.4_linux_amd64.zip
+          chmod +x terraform 
+          sudo mv terraform /usr/local/bin/terraform
+          cd / && terraform -v
+          
+          # install helm
+          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+
+          # install kubectl
+          sudo curl -LO https://storage.googleapis.com/kubernetes-release/release/`curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt`/bin/linux/amd64/kubectl
+          sudo chmod +x ./kubectl 
+          sudo mv ./kubectl /usr/local/bin/kubectl
+
+          # configure kops
+          sudo curl -Lo kops https://github.com/kubernetes/kops/releases/download/$(curl -s https://api.github.com/repos/kubernetes/kops/releases/latest | grep tag_name | cut -d '"' -f 4)/kops-linux-amd64
+          sudo chmod +x kops
+          sudo mv kops /usr/local/bin/kops
+          kops export kubecfg bootcamp.k8s.local --state s3://bootcamp-kops-state-i537sz
+  
+  deploy-db:
+    steps:
+    - run:
+        name: Deploy DATABASE
+        command: |
+          cd artifacts/infra
+          make init
+          make up
+          echo "mongodb://$(terraform output -raw db_user):$(terraform output -raw db_pass)@$(terraform output -raw db_endpoint):27017/" > ../../db_connection_string.txt
+
+  deploy-app:
+    parameters:
+      envName:  
+        type: string
+        default: "test"
+    steps:
+    - run:
+        name: Deploy app
+        command: |
+          helm upgrade todo-app artifacts/todo-0.1.0.tgz -i --wait -n << parameters.envName >> --set image=$(cat artifacts/image.txt),podVars.env=<< parameters.envName >>,podVars.dbHost=$(cat db_connection_string.txt)
+
+  smoke-test:
+    parameters:
+      envName: 
+        type: string
+        default: "test"
+    steps:
+      - run:
+          name: Smoke test
+          command: |
+            export endpoint=$(kubectl get service/todo-app -n << parameters.envName >> -o json | jq '.status.loadBalancer.ingress[0].hostname' | sed -e 's/^"//' -e 's/"$//')
+            echo $endpoint
+            export returncode=$(curl -s -o /dev/null -w "%{http_code}" ${endpoint})
+            if [ $returncode -ne "200" ]
+            then
+              echo "Return Code was not 200, it was: ${returncode}"
+              exit 1
+            fi
+
+jobs:
+  build:
+    docker:
+      - image: circleci/node:lts
+    environment:
+      JEST_JUNIT_OUTPUT_DIR: test-output/
+    steps:
+      - checkout
+      - install_deps
+ 
+      - run: |
+          cd src/
+          npm run test-lint
+          npm run test-unit
+      
+      - store_test_results:
+          path: src/test-output/
+
+  integration-test:
+    docker:
+      - image: circleci/node:lts
+      - image: mongo:4.0
+    environment:
+      JEST_JUNIT_OUTPUT_DIR: test-output/
+    steps:
+      - checkout
+      - install_deps
+      - run:
+          name: Run integration tests
+          command:
+            npm run test-integration --prefix src/
+      - store_test_results:
+          path: src/test-output/
+
+  e2e:
+    docker:
+      - image: qawolf/qawolf:v0.9.2
+    environment:
+      QAW_HEADLESS: true
+
+    steps: 
+      - checkout
+
+      - run:
+          name: setup
+          command: |
+            # install kubectl
+            curl -LO https://storage.googleapis.com/kubernetes-release/release/`curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt`/bin/linux/amd64/kubectl
+            chmod +x ./kubectl 
+            mv ./kubectl /usr/local/bin/kubectl
+
+            # configure kops
+            sudo curl -Lo kops https://github.com/kubernetes/kops/releases/download/$(curl -s https://api.github.com/repos/kubernetes/kops/releases/latest | grep tag_name | cut -d '"' -f 4)/kops-linux-amd64
+            chmod +x kops
+            mv kops /usr/local/bin/kops
+            kops export kubecfg bootcamp.k8s.local --state s3://bootcamp-kops-state-i537sz
+
+            apt-get install jq -y
+
+      - run: 
+          name: End 2 end tests
+          no_output_timeout: 2m
+          command: |
+            export ENDPOINT=http://$(kubectl get service/todo-app -n test -o json | jq '.status.loadBalancer.ingress[0].hostname' | sed -e 's/^"//' -e 's/"$//')
+            echo $ENDPOINT
+            cd src
+            npm install
+            npm run test-e2e
+
+  package:
+    machine: true
+    environment:
+      ECR: 883220488588.dkr.ecr.ap-southeast-2.amazonaws.com
+      reponame: bootcamp-container-repo
+    steps:
+      - checkout
+
+      - run:
+          name: Set up
+          command: |
+            mkdir -p artifacts
+
+            # install AWS CLI
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+
+            # instll helm
+            curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+      
+      - run: 
+          name: Build image
+          command: |
+            cd src
+            export IMAGE_TAG=${ECR}/${reponame}:${CIRCLE_SHA1}
+            echo ${IMAGE_TAG} > ../artifacts/image.txt
+            docker build -t ${IMAGE_TAG} .
+            aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS --password-stdin ${ECR}
+            docker push ${IMAGE_TAG}
+
+      - run:
+          name: Package helm
+          command: | 
+            helm package helm/todo --app-version ${CIRCLE_SHA1} -d artifacts
+
+      - run:
+          name: Package infra
+          command: |
+            cp -r infra artifacts/infra
+
+      - store_artifacts: 
+          path: ./artifacts
+
+      - persist_to_workspace:
+          root: ./
+          paths:
+            - artifacts
+
+  deploy-test:
+    docker:
+      - image: cimg/base:2022.04
+    environment:
+      ENV: test
+    steps:
+      - attach_workspace:
+          at: ./
+      - setup-cd
+      - deploy-db
+      - deploy-app:
+          envName: "test"
+      - smoke-test:
+          envName: "test"
+
+  deploy-prod:
+    docker:
+      - image: cimg/base:2022.04
+    environment:
+      ENV: prod
+    steps:
+      - attach_workspace:
+          at: ./
+      - setup-cd
+      - deploy-db
+      - deploy-app:
+          envName: "prod"
+      - smoke-test:
+          envName: "prod"
+
+workflows:
+  version: 2
+  build-test-package:
+    jobs:
+      - build
+      - integration-test:
+          requires: 
+            - build
+      - package:
+          requires:
+            - integration-test
+          filters:
+            branches:
+              only: master
+      - deploy-test:
+          requires:
+            - package
+      - e2e:
+          requires:
+            - deploy-test
+      - stage-gate:
+          type: approval
+          requires:
+            - e2e
+      - deploy-prod:
+          requires:
+            - stage-gate

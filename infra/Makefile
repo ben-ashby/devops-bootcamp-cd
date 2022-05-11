@@ -5,4 +5,4 @@ down:
 	terraform destroy --auto-approve -var environment=${ENV}
 
 init:
-	terraform init --backend-config="key=state/${ENV}.tfstate" --backend-config="dynamodb_table=bootcamp-locktable-i537sz" --backend-config="bucket=bootcamp-tfstate-i537sz"
+	terraform init --backend-config="key=state/${ENV}.tfstate" --backend-config="dynamodb_table=bootcamp-locktable-tioe3s" --backend-config="bucket=bootcamp-tfstate-tioe3s"

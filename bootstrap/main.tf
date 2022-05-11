@@ -1,15 +1,18 @@
 terraform {
+  required_version = ">= 0.13"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 3.0"
+      version = "=4.4.0"
     }
   }
 }
 
+
 provider "aws" {
-  region  = "ap-southeast-2"
+  region = "ap-southeast-2"
 }
+
 
 resource "random_string" "tfstatename" {
   length = 6
@@ -19,7 +22,6 @@ resource "random_string" "tfstatename" {
 
 resource "aws_s3_bucket" "kops_state" {
   bucket        = "bootcamp-kops-state-${random_string.tfstatename.result}"
-  acl           = "private"
   force_destroy = true
 
   tags = {
@@ -29,7 +31,6 @@ resource "aws_s3_bucket" "kops_state" {
 
 resource "aws_s3_bucket" "tfrmstate" {
   bucket        = "bootcamp-tfstate-${random_string.tfstatename.result}"
-  acl           = "private"
   force_destroy = true
 
   tags = {
